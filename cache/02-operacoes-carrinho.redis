@@ -1,0 +1,148 @@
+# =============================================================================
+# PARTE 2 - MINI PROJETO: OPERACOES DO CARRINHO NO REDIS
+# Adicionar item, ler o carrinho completo e definir TTL (carrinho abandonado)
+# -----------------------------------------------------------------------------
+# Pre-requisito: rodar antes cache/01-key-design.redis
+# Como executar:
+#   grep -v '^#' cache/02-operacoes-carrinho.redis | grep -v '^$' | redis-cli
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# 2.1 ADICIONAR UM ITEM AO CARRINHO
+# -----------------------------------------------------------------------------
+
+# Produto novo no carrinho do usuario 1 (quantidade 1)
+HSET cart:user:1 produto:104 1
+
+# Mesmo produto adicionado de novo: HINCRBY soma a quantidade sem precisar ler
+# o valor antes (operacao atomica, resolve a condicao de corrida de duas abas
+# clicando em "comprar" ao mesmo tempo)
+HINCRBY cart:user:1 produto:104 1
+
+# Cliente digitou a quantidade na tela: HSET sobrescreve o valor do campo
+HSET cart:user:1 produto:102 3
+
+# Adicionar varios itens de uma vez (uma unica ida e volta ate o servidor)
+HSET cart:user:1 produto:108 1 produto:106 1
+
+# Adicionar somente se o item ainda nao estiver no carrinho (devolve 0 se ja existe)
+HSETNX cart:user:1 produto:108 5
+
+
+# -----------------------------------------------------------------------------
+# 2.2 LER O CARRINHO
+# -----------------------------------------------------------------------------
+
+# Carrinho completo: devolve pares campo/valor (produto -> quantidade)
+HGETALL cart:user:1
+
+# Quantidade de um item especifico
+HGET cart:user:1 produto:104
+
+# Quantos itens distintos existem no carrinho (para o badge do icone)
+HLEN cart:user:1
+
+# Apenas os ids dos produtos (para buscar preco e nome no banco principal)
+HKEYS cart:user:1
+
+# Apenas as quantidades
+HVALS cart:user:1
+
+# Verificar se um produto esta no carrinho
+HEXISTS cart:user:1 produto:102
+
+# Metadados do carrinho
+HGETALL cart:user:1:meta
+
+
+# -----------------------------------------------------------------------------
+# 2.3 ALTERAR E REMOVER ITENS
+# -----------------------------------------------------------------------------
+
+# Diminuir a quantidade (HINCRBY com valor negativo)
+HINCRBY cart:user:1 produto:102 -1
+
+# Remover um item do carrinho
+HDEL cart:user:1 produto:106
+
+# Esvaziar o carrinho sem apagar o historico de metadados
+DEL cart:user:1
+
+
+# -----------------------------------------------------------------------------
+# 2.4 TTL - SIMULANDO O ABANDONO DO CARRINHO
+# -----------------------------------------------------------------------------
+
+# Recria o carrinho (ele foi apagado no teste acima)
+HSET cart:user:1 produto:102 2 produto:103 1 produto:104 2
+
+# IMPORTANTE: DEL/HSET em uma chave nova zera o TTL. Toda escrita no carrinho
+# precisa renovar a expiracao, senao o carrinho vira chave eterna na memoria.
+# 86400 segundos = 24 horas
+EXPIRE cart:user:1 86400
+EXPIRE cart:user:1:meta 86400
+
+# Quanto tempo falta para o carrinho expirar (em segundos)
+TTL cart:user:1
+
+# Carrinho de visitante nao logado expira mais rapido (2 horas)
+EXPIRE cart:session:a1b2c3d4 7200
+TTL cart:session:a1b2c3d4
+
+# Expirar em uma data/hora exata (timestamp Unix) em vez de uma duracao
+# EXPIREAT cart:user:1 1764086400
+
+# Renovar o TTL somente se a chave ja tiver expiracao definida (Redis 7+)
+EXPIRE cart:user:1 86400 XX
+
+# Tirar a expiracao (ex.: carrinho marcado como "lista de desejos")
+# PERSIST cart:user:1
+
+# Demonstracao real da expiracao com TTL curto, usando outra chave
+SET cart:user:99:teste "carrinho de teste"
+EXPIRE cart:user:99:teste 1
+TTL cart:user:99:teste
+
+
+# -----------------------------------------------------------------------------
+# 2.5 ESCRITA ATOMICA: ITEM + METADADO + TTL + INDICE EM UMA TRANSACAO
+# Na aplicacao real, toda adicao de item executa esse bloco inteiro.
+# -----------------------------------------------------------------------------
+MULTI
+HINCRBY cart:user:1 produto:105 1
+HSET cart:user:1:meta atualizado_em 1764003600
+EXPIRE cart:user:1 86400
+EXPIRE cart:user:1:meta 86400
+ZADD cart:abandoned 1764003600 user:1
+EXEC
+
+# Estado final do carrinho
+HGETALL cart:user:1
+TTL cart:user:1
+
+
+# -----------------------------------------------------------------------------
+# 2.6 LOGIN DO VISITANTE: MIGRAR O CARRINHO DA SESSAO PARA O USUARIO
+# -----------------------------------------------------------------------------
+
+# O Redis nao tem comando de "merge" de hashes, entao a aplicacao le o carrinho
+# da sessao (HGETALL) e grava item por item com HINCRBY no carrinho do usuario.
+# Exemplo com o produto 105 que estava na sessao a1b2c3d4:
+MULTI
+HINCRBY cart:user:1 produto:105 1
+DEL cart:session:a1b2c3d4
+EXPIRE cart:user:1 86400
+EXEC
+
+HGETALL cart:user:1
+EXISTS cart:session:a1b2c3d4
+
+
+# -----------------------------------------------------------------------------
+# 2.7 LISTAR CARRINHOS ABANDONADOS (candidatos ao e-mail de recuperacao)
+# Carrinhos cuja ultima alteracao foi antes de um determinado timestamp.
+# Em producao usa-se SCAN, nunca KEYS, para nao travar o servidor.
+# -----------------------------------------------------------------------------
+ZRANGEBYSCORE cart:abandoned -inf 1764003600
+SCAN 0 MATCH cart:user:* COUNT 100
