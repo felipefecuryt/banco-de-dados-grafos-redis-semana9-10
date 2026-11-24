@@ -1,0 +1,105 @@
+# =============================================================================
+# PARTE 1 - ESTRUTURA DE CACHE: KEY DESIGN DO CARRINHO DE COMPRAS (Redis)
+# -----------------------------------------------------------------------------
+# Como executar (o grep remove os comentarios, que o redis-cli nao interpreta):
+#   grep -v '^#' cache/01-key-design.redis | grep -v '^$' | redis-cli
+# =============================================================================
+#
+# -----------------------------------------------------------------------------
+# PADRAO DE NOMENCLATURA ADOTADO
+# -----------------------------------------------------------------------------
+#   <dominio>:<entidade>:<identificador>[:<sufixo>]
+#
+# Regras seguidas em todas as chaves:
+#   1. Dois-pontos ":" como separador de niveis (convencao da propria Redis;
+#      e o que o RedisInsight usa para desenhar a arvore de chaves).
+#   2. Tudo em minusculo, sem acento, sem espaco e sem caractere especial.
+#   3. Prefixo de dominio sempre primeiro ("cart:"), para permitir varredura
+#      por dominio com SCAN MATCH cart:* e facilitar metricas por prefixo.
+#   4. Identificador sempre no fim do nivel, nunca no meio do nome.
+#   5. Nome curto, porque a chave tambem ocupa memoria (sao milhoes delas).
+#
+# -----------------------------------------------------------------------------
+# CHAVES DO CARRINHO
+# -----------------------------------------------------------------------------
+#  CHAVE                        TIPO    CONTEUDO                        TTL
+#  ---------------------------  ------  ------------------------------  -------
+#  cart:user:{userId}           Hash    field = produto:{produtoId}     86400s
+#                                       value = quantidade              (24h)
+#
+#  cart:session:{sessionId}     Hash    mesmo formato, para visitante   7200s
+#                                       nao logado (checkout de convi-  (2h)
+#                                       dado); migra para cart:user no
+#                                       login
+#
+#  cart:user:{userId}:meta      Hash    metadados: atualizado_em,       86400s
+#                                       cupom, canal                    (24h)
+#
+#  cart:abandoned               ZSet    indice de carrinhos ativos       sem TTL
+#                                       score = timestamp da ultima     (bonus)
+#                                       alteracao; usado para disparar
+#                                       e-mail de carrinho abandonado
+#
+# Exemplos concretos de chave:
+#   cart:user:1           -> carrinho do usuario 1 (logado)
+#   cart:user:1:meta      -> metadados do carrinho do usuario 1
+#   cart:session:a1b2c3d4 -> carrinho de um visitante sem login
+#
+# -----------------------------------------------------------------------------
+# POR QUE HASH E NAO STRING COM JSON
+# -----------------------------------------------------------------------------
+#   - Alterar a quantidade de UM item nao exige reescrever o carrinho inteiro:
+#     HSET/HINCRBY mexem em um campo so (O(1)), enquanto com JSON seria
+#     GET -> desserializar -> alterar -> serializar -> SET (read-modify-write,
+#     que ainda abre espaco para condicao de corrida entre duas abas).
+#   - HGETALL devolve o carrinho completo em uma unica ida ao servidor.
+#   - HDEL remove um item; HLEN conta os itens sem trazer os dados.
+#   - Hash pequeno (ate 128 campos) e armazenado internamente como listpack,
+#     ocupando bem menos memoria que o JSON equivalente.
+#   - O TTL no Redis e por CHAVE, nao por campo: como o carrinho inteiro deve
+#     expirar junto, um Hash por carrinho e a granularidade correta.
+#
+# -----------------------------------------------------------------------------
+# POR QUE NAO USAR UMA CHAVE POR ITEM (cart:user:1:produto:102)
+# -----------------------------------------------------------------------------
+#   Ler o carrinho exigiria SCAN ou varias chamadas, e cada item teria TTL
+#   proprio - o carrinho expiraria "em pedacos", mostrando um carrinho
+#   incompleto para o cliente.
+#
+# -----------------------------------------------------------------------------
+# OBSERVACAO SOBRE CLUSTER (hash tags)
+# -----------------------------------------------------------------------------
+#   Em Redis Cluster, chaves de um mesmo usuario precisam cair no mesmo slot
+#   para poderem ser usadas na mesma transacao/pipeline. Nesse caso o padrao
+#   passa a ser cart:{user:1} e cart:{user:1}:meta - as chaves entre { } sao
+#   as unicas consideradas no calculo do slot.
+#
+# =============================================================================
+# CRIACAO DA ESTRUTURA (estado inicial de exemplo)
+# =============================================================================
+
+# Limpa o banco de teste para a demonstracao comecar do zero
+FLUSHDB
+
+# Carrinho do usuario 1 (logado): 2 unidades do produto 102 e 1 do produto 103
+HSET cart:user:1 produto:102 2 produto:103 1
+
+# Metadados do mesmo carrinho
+HSET cart:user:1:meta atualizado_em 1764000000 cupom NENHUM canal web
+
+# Carrinho de um visitante ainda sem login
+HSET cart:session:a1b2c3d4 produto:105 1
+
+# Expiracao: 24h para usuario logado, 2h para visitante
+EXPIRE cart:user:1 86400
+EXPIRE cart:user:1:meta 86400
+EXPIRE cart:session:a1b2c3d4 7200
+
+# Indice de carrinhos ativos (para a campanha de carrinho abandonado)
+ZADD cart:abandoned 1764000000 user:1
+
+# Conferencia do que foi criado
+KEYS cart:*
+TYPE cart:user:1
+HGETALL cart:user:1
+TTL cart:user:1
