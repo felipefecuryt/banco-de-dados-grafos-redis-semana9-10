@@ -1,0 +1,132 @@
+# =============================================================================
+# PARTE 3 - DESAFIO (BONUS): ESTRATEGIA DE INVALIDACAO DO CACHE
+# O que acontece com a chave do carrinho quando o usuario finaliza a compra
+# -----------------------------------------------------------------------------
+# Pre-requisito: rodar antes cache/01 e cache/02
+# Como executar:
+#   grep -v '^#' cache/03-invalidacao-checkout.redis | grep -v '^$' | redis-cli
+# =============================================================================
+#
+# -----------------------------------------------------------------------------
+# ORDEM CORRETA DAS OPERACOES NO CHECKOUT
+# -----------------------------------------------------------------------------
+#   1. Ler o carrinho do Redis .............. HGETALL cart:user:1
+#   2. Validar preco e estoque no banco principal (a fonte da verdade)
+#   3. Gravar o PEDIDO no banco principal (transacao commitada)
+#   4. Confirmar o pagamento
+#   5. SOMENTE ENTAO invalidar o cache ...... DEL cart:user:1
+#
+#   A ordem importa: se o cache fosse apagado antes do pedido ser gravado e a
+#   gravacao falhasse, o cliente perderia o carrinho e nao teria pedido - o
+#   pior resultado possivel. Apagando depois, o pior caso e um carrinho que
+#   sobrevive por alguns segundos, e que o proprio TTL de 24h resolve.
+#
+# -----------------------------------------------------------------------------
+# QUANDO INVALIDAR (gatilhos)
+# -----------------------------------------------------------------------------
+#   EVENTO                           ACAO
+#   ------------------------------   ----------------------------------------
+#   Checkout concluido               DEL do carrinho + metadados + indice
+#   Cliente clica em "limpar"        DEL do carrinho
+#   Item removido                    HDEL do campo (invalidacao parcial)
+#   Preco/estoque mudou              nao apaga: o preco NAO fica no cache,
+#                                    so o id e a quantidade, justamente para
+#                                    o carrinho nunca ficar com preco velho
+#   Logout                           mantem (o carrinho volta no proximo login)
+#   Carrinho abandonado              expira sozinho pelo TTL (24h)
+#
+# -----------------------------------------------------------------------------
+# O QUE O CACHE GUARDA E O QUE NAO GUARDA (decisao de modelagem)
+# -----------------------------------------------------------------------------
+#   Guarda.....: produto_id e quantidade (dado volatil, barato de perder)
+#   Nao guarda.: preco, nome, estoque e total - sao lidos do banco principal
+#                na hora de montar a tela e no checkout.
+#   Consequencia: nao existe cache de preco desatualizado para invalidar, que
+#   e a classe de bug mais comum em cache de carrinho.
+#
+# =============================================================================
+# SCRIPTS DA INVALIDACAO
+# =============================================================================
+
+# Estado antes do checkout
+HGETALL cart:user:1
+TTL cart:user:1
+
+
+# -----------------------------------------------------------------------------
+# 3.1 INVALIDACAO SIMPLES (a resposta direta do exercicio)
+# -----------------------------------------------------------------------------
+DEL cart:user:1
+
+
+# -----------------------------------------------------------------------------
+# 3.2 INVALIDACAO COMPLETA E ATOMICA (o que a aplicacao realmente executa)
+# Apaga o carrinho, os metadados e tira o usuario do indice de abandonados,
+# tudo em um unico passo - nao existe estado intermediario visivel.
+# -----------------------------------------------------------------------------
+
+# Recria o cenario para a demonstracao
+HSET cart:user:1 produto:102 2 produto:103 1
+HSET cart:user:1:meta atualizado_em 1764003600 cupom NENHUM canal web
+EXPIRE cart:user:1 86400
+ZADD cart:abandoned 1764003600 user:1
+
+MULTI
+UNLINK cart:user:1
+UNLINK cart:user:1:meta
+ZREM cart:abandoned user:1
+EXEC
+
+# UNLINK em vez de DEL: o UNLINK remove a chave do espaco de nomes na hora e
+# libera a memoria em uma thread de fundo. Para hash grande (carrinho com
+# muitos itens) isso evita travar o servidor durante a liberacao.
+
+
+# -----------------------------------------------------------------------------
+# 3.3 CONFERENCIA DA INVALIDACAO
+# -----------------------------------------------------------------------------
+
+# Deve retornar 0 (chave nao existe mais)
+EXISTS cart:user:1
+EXISTS cart:user:1:meta
+
+# Deve retornar lista vazia
+HGETALL cart:user:1
+
+# Deve retornar -2 (chave inexistente). Os codigos do TTL:
+#   -2 = a chave nao existe
+#   -1 = a chave existe mas nao tem expiracao definida
+TTL cart:user:1
+
+# O usuario nao deve mais estar na lista de carrinhos abandonados
+ZSCORE cart:abandoned user:1
+
+# Visao geral do que sobrou
+KEYS cart:*
+
+
+# -----------------------------------------------------------------------------
+# 3.4 INVALIDACAO IDEMPOTENTE (reprocessamento e nova tentativa)
+# -----------------------------------------------------------------------------
+# DEL/UNLINK de chave que nao existe retorna 0 e nao da erro. Isso torna a
+# invalidacao idempotente: se a fila de pedidos entregar o mesmo evento de
+# checkout duas vezes, a segunda execucao nao quebra nada.
+DEL cart:user:1
+UNLINK cart:user:1
+
+
+# -----------------------------------------------------------------------------
+# 3.5 ALTERNATIVA: EXPIRAR EM VEZ DE APAGAR (janela de seguranca)
+# -----------------------------------------------------------------------------
+# Em vez do DEL imediato, da-se um TTL curto. Se o pagamento for estornado nos
+# proximos minutos, o carrinho ainda pode ser restaurado para o cliente.
+HSET cart:user:1 produto:102 2 produto:103 1
+EXPIRE cart:user:1 300
+TTL cart:user:1
+
+# Limpeza final da demonstracao
+DEL cart:user:1
+DEL cart:user:1:meta
+DEL cart:abandoned
+DEL cart:user:99:teste
+KEYS cart:*
